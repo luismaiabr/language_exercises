@@ -12,7 +12,7 @@ A lightweight, zero-authentication web application designed to ingest AI-generat
 * **User & Subscription Validation:** Upon receiving a request for `/<email>/`, the backend must query Supabase to verify:
   1. The user exists in the `users` table and `is_active` is `True`.
   2. The user has a corresponding record in the `subscriptions` table where `is_subscribed` is `True` for the target course (e.g., `course_name = "German Theory"`).
-* **Latest Lesson Resolution:** If validation passes, the system queries the `questions` table for that `user_id` (or course subscription) ordered by `date` descending (`ORDER BY date DESC LIMIT 1`) and returns the most recent lesson payload.
+* **Latest Lesson Resolution:** If validation passes, the system queries the `exercises` table for that `user_id` and subscription, selects the highest `lesson` number, and returns all exercises in that lesson.
 * **Empty/Inactive States:** If the user is inactive, unsubscribed, or has no lessons generated yet, the UI renders a clean, localized state indicating the status.
 
 ### 2.2. Webhook Ingestion (Internal API)
@@ -38,7 +38,7 @@ A lightweight, zero-authentication web application designed to ingest AI-generat
 ## 3. Technical & UI Requirements
 
 * **Backend Stack:** Python 3.11+ with FastAPI and Pydantic V2.
-* **Database:** Supabase (PostgreSQL). Uses `JSONB` for storing the polymorphic array of exercise objects inside the `questions` table, paired with relational integrity (`FOREIGN KEY`) across `users` and `subscriptions`.
+* **Database:** Supabase (PostgreSQL). Uses normalized `exercises` and `answers` tables, paired with relational integrity (`FOREIGN KEY`) across `users` and `subscriptions`.
 * **UI Aesthetic:** High-contrast monochromatic palette:
   * **Backgrounds:** Deep Black (`#0A0A0A`) and Dark Charcoal (`#141414`).
   * **Typography:** Crisp Off-White (`#F5F5F5`) and Muted Gray (`#A3A3A3`).
@@ -49,7 +49,7 @@ A lightweight, zero-authentication web application designed to ingest AI-generat
 
 ## 4. Database Architecture (Supabase / PostgreSQL)
 
-To maintain data integrity and performance in Supabase, the schema requires three core tables (`users`, `subscriptions`, and `questions`), enhanced with UUID primary keys, indexing on `email` and `date`, and unique constraints:
+To maintain data integrity and performance in Supabase, the schema requires four core tables (`users`, `subscriptions`, `exercises`, and `answers`), enhanced with UUID primary keys, indexes on lookup fields, and unique constraints:
 
 1. **`users` Table:**
    * `id` (`UUID`, Primary Key, Default: `gen_random_uuid()`)
@@ -66,15 +66,53 @@ To maintain data integrity and performance in Supabase, the schema requires thre
    * `updated_at` (`TIMESTAMPTZ`, Default: `now()`)
    * *Constraint:* `UNIQUE(user_id, course_name)` to prevent duplicate course rows per user.
 
-3. **`questions` Table (Daily Lesson Payload):**
+3. **`exercises` Table:**
    * `id` (`UUID`, Primary Key, Default: `gen_random_uuid()`)
    * `user_id` (`UUID`, Foreign Key -> `users.id` ON DELETE CASCADE, Not Null)
    * `subscription_id` (`UUID`, Foreign Key -> `subscriptions.id` ON DELETE SET NULL, Nullable)
-   * `date` (`DATE`, Not Null, Default: `CURRENT_DATE`, Indexed) — *Used to resolve the latest lesson.*
-   * `lesson_title` (`VARCHAR`, Not Null)
-   * `theory_summary` (`TEXT`, Nullable) — *Passed to the AI during written evaluation so the LLM knows the exact scope of the day's email.*
-   * `exercises` (`JSONB`, Not Null) — *Stores the validated array of `MultipleChoiceExercise` and `WrittenExercise` objects.*
+   * `date` (`DATE`, Not Null, Default: `CURRENT_DATE`, Indexed) — *Publication or class date.*
+   * `lesson` (`INTEGER`, Not Null) — *Stable, sequential lesson number for this user and course.*
+   * `exercise_type` (`VARCHAR`, Not Null) — *For example, `multiple_choice` or `written`.*
+   * `question` (`TEXT`, Not Null)
+   * `options` (`JSONB`, Nullable) — *Optional choices for multiple-choice exercises; null for written exercises.*
+   * `theory_summary` (`TEXT`, Nullable) — *Context passed to the AI during written evaluation.*
    * `created_at` (`TIMESTAMPTZ`, Default: `now()`)
+   * *Constraints:* `CHECK (lesson > 0)` and `UNIQUE(id, user_id)` for composite answer ownership validation. If a separate exercise sequence is required, the ingestion process must provide a stable exercise identifier.
+   * *Indexes:* `INDEX(user_id, subscription_id, lesson)` and `INDEX(user_id, date)`.
+
+4. **`answers` Table:**
+   * `id` (`UUID`, Primary Key, Default: `gen_random_uuid()`)
+   * `exercise_id` (`UUID`, Foreign Key -> `exercises.id` ON DELETE CASCADE, Not Null)
+   * `user_id` (`UUID`, Foreign Key -> `users.id` ON DELETE CASCADE, Not Null)
+   * `date` (`DATE`, Not Null) — *Date on which the answer was submitted.*
+   * `lesson` (`INTEGER`, Not Null) — *Copied from the exercise to support lesson-level reporting.*
+   * `exercise_type` (`VARCHAR`, Not Null) — *Copied from the exercise for reporting and validation.*
+   * `answer` (`TEXT`, Not Null) — *The selected option text or submitted written response.*
+   * `created_at` (`TIMESTAMPTZ`, Default: `now()`)
+   * *Constraints:* `CHECK (lesson > 0)` and composite `FOREIGN KEY(exercise_id, user_id) REFERENCES exercises(id, user_id)` so an answer cannot be recorded for another user's exercise. Multiple rows are allowed when answer history and retries are required.
+   * *Indexes:* `INDEX(user_id, lesson)` and `INDEX(exercise_id, created_at)`.
+
+### 4.1. Lesson Identification
+
+Use the **lesson number** as the canonical lesson identifier and retain `date` as lesson metadata.
+
+* A lesson number is stable even when an email is delayed, regenerated, or imported after the day it was created.
+* Dates are not guaranteed to be unique: a lesson may be corrected or retried on the same date, and users in different time zones may cross a date boundary.
+* The ingestion process must assign a positive, sequential `lesson` number per user and course. The application must not infer the lesson number from the calendar date.
+* `date` remains indexed for scheduling, display, and queries such as “latest published lesson.” When two records have the same date, resolve ties by the highest `lesson` number and then `created_at`.
+* Answers should reference `exercise_id`; their copied `date`, `lesson`, and `exercise_type` values are denormalized reporting fields and must be validated against the referenced exercise on write.
+
+The latest lesson query should therefore select the highest lesson number for the user and subscription, rather than relying only on a date:
+
+```sql
+SELECT lesson
+FROM exercises
+WHERE user_id = :user_id
+  AND subscription_id IS NOT DISTINCT FROM :subscription_id
+GROUP BY lesson
+ORDER BY lesson DESC
+LIMIT 1;
+```
 
 ---
 
@@ -87,7 +125,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 # ==========================================
-# 1. EXERCISE SCHEMAS (JSONB Content)
+# 1. EXERCISE CONTENT SCHEMAS
 # ==========================================
 
 class ChoiceOption(BaseModel):
@@ -146,20 +184,35 @@ class Subscription_db(BaseModel):
     is_subscribed: bool = Field(default=True, description="Whether the user actively receives/accesses lessons.")
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-class Question_db(BaseModel):
-    """Represents a row in the Supabase 'questions' table (stores a daily lesson's exercises)."""
+class Exercise_db(BaseModel):
+    """Represents one row in the Supabase 'exercises' table."""
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID = Field(default_factory=uuid4, description="Primary Key (UUID).")
     user_id: UUID = Field(..., description="Foreign Key referencing users.id.")
     subscription_id: Optional[UUID] = Field(default=None, description="Foreign Key referencing subscriptions.id.")
     date: dt_date = Field(default_factory=dt_date.today, description="The calendar date of the class.")
-    lesson_title: str = Field(..., description="Title extracted or summarized from the daily email.")
+    lesson: int = Field(..., gt=0, description="Stable sequential lesson number.")
+    exercise_type: Literal["multiple_choice", "written"]
+    question: str = Field(..., min_length=1)
+    options: Optional[List[ChoiceOption]] = Field(default=None, description="Choices for multiple-choice exercises.")
     theory_summary: Optional[str] = Field(
         default=None, 
         description="Condensed context of the email theory; injected into the AI prompt when evaluating written answers."
     )
-    exercises: List[Exercise] = Field(..., min_length=1, description="Stored as JSONB in Supabase.")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Answer_db(BaseModel):
+    """Represents one row in the Supabase 'answers' table."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(default_factory=uuid4, description="Primary Key (UUID).")
+    exercise_id: UUID = Field(..., description="Foreign Key referencing exercises.id.")
+    user_id: UUID = Field(..., description="Foreign Key referencing users.id.")
+    date: dt_date = Field(default_factory=dt_date.today, description="Date the answer was submitted.")
+    lesson: int = Field(..., gt=0, description="Lesson number copied from the exercise.")
+    exercise_type: Literal["multiple_choice", "written"]
+    answer: str = Field(..., min_length=1)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -168,17 +221,17 @@ class Question_db(BaseModel):
 # ==========================================
 
 class WebhookIngestionPayload(BaseModel):
-    """Payload sent by n8n to create a new daily question set."""
+    """Payload sent by n8n to create a new lesson's exercise rows."""
     email: EmailStr
     course_name: str = "German Theory"
     date: dt_date = Field(default_factory=dt_date.today)
-    lesson_title: str
+    lesson: int = Field(..., gt=0)
     theory_summary: Optional[str] = None
     exercises: List[Exercise] = Field(..., min_length=1)
 
 class WrittenEvaluationRequest(BaseModel):
     """Payload sent by the frontend when the user submits a written answer."""
-    question_id: UUID = Field(..., description="ID of the Question_db row for context lookup.")
+    exercise_id: UUID = Field(..., description="ID of the Exercise_db row for context lookup.")
     question_prompt: str = Field(..., description="The specific WrittenExercise.question text.")
     user_answer: str = Field(..., min_length=1, description="The raw text typed by the user.")
 
@@ -215,7 +268,8 @@ A dedicated `magic_links` table is added to decouple authentication from the pri
   * `id` (`UUID`, Primary Key, Default: `gen_random_uuid()`)
   * `token` (`VARCHAR(64)`, Unique, Indexed, Not Null) — *The capability key in the URL path.*
   * `user_id` (`UUID`, Foreign Key -> `users.id` ON DELETE CASCADE, Not Null)
-  * `question_id` (`UUID`, Foreign Key -> `questions.id` ON DELETE CASCADE, Not Null) — *Directly binds the token to that specific daily lesson.*
+  * `subscription_id` (`UUID`, Foreign Key -> `subscriptions.id` ON DELETE CASCADE, Not Null)
+  * `lesson` (`INTEGER`, Not Null) — *Directly binds the token to that specific daily lesson.*
   * `created_at` (`TIMESTAMPTZ`, Default: `now()`, Not Null)
   * `expires_at` (`TIMESTAMPTZ`, Not Null) — *Calculated as `created_at + INTERVAL '<MAGIC_LINK_TIMESPAN> days'`.*
   * `is_revoked` (`BOOLEAN`, Default: `False`, Not Null)
@@ -231,7 +285,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 # Configurable environment / system constant
-MAGIC_LINK_TIMESPAN_DAYS: int = 3  # Default fallback; overridden by <MAGIC_LINK_TIMESPAN>
+MAGIC_LINK_TIMESPAN_DAYS: int = 7  # Default fallback; overridden by <MAGIC_LINK_TIMESPAN>
 
 class MagicLink_db(BaseModel):
     """Represents a row in the Supabase 'magic_links' table."""
@@ -243,7 +297,8 @@ class MagicLink_db(BaseModel):
         description="High-entropy URL-safe token used in /lesson/{token}."
     )
     user_id: UUID = Field(..., description="Foreign key to users.id.")
-    question_id: UUID = Field(..., description="Foreign key to the specific Question_db lesson.")
+    subscription_id: UUID = Field(..., description="Foreign key to the user's subscription.")
+    lesson: int = Field(..., gt=0, description="Lesson number bound to this token.")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime = Field(
         default_factory=lambda: datetime.utcnow() + timedelta(days=MAGIC_LINK_TIMESPAN_DAYS),
@@ -265,7 +320,10 @@ class MagicLinkResolutionResponse(BaseModel):
     is_valid: bool
     status: str = Field(..., description="'active', 'expired', or 'revoked'")
     expires_at: datetime
-    lesson: Optional[dict] = Field(default=None, description="The Question_db payload if token is valid.")
+    lesson_exercises: Optional[List[Exercise_db]] = Field(
+        default=None,
+        description="The exercises in the bound lesson if the token is valid."
+    )
 
 class DynamicWrittenEvaluationRequest(BaseModel):
     """Protected written answer evaluation requiring the valid token."""

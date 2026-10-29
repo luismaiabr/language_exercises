@@ -1,7 +1,7 @@
 # System Requirements Specification: AI-Driven German Exercise Platform
 
 ## 1. System Overview
-A lightweight, zero-authentication web application designed to ingest AI-generated German lessons from an n8n webhook, store them in a Supabase (PostgreSQL) database, and serve them to users via a personalized URL path (`/<email>/`). The system evaluates multiple-choice exercises instantaneously on the client side using pre-calculated explanations, while written exercises are evaluated dynamically at runtime by an AI agent via the backend.
+A lightweight, zero-authentication web application designed to receive raw German lesson text (the theory email) from n8n, generate the exercises in the backend with an AI model, store them in a Supabase (PostgreSQL) database, and serve them to users via a personalized URL path (`/<email>/`). The system evaluates multiple-choice exercises instantaneously on the client side using pre-calculated explanations, while written exercises are evaluated dynamically at runtime by an AI agent via the backend.
 
 ---
 
@@ -15,10 +15,15 @@ A lightweight, zero-authentication web application designed to ingest AI-generat
 * **Latest Lesson Resolution:** If validation passes, the system queries the `exercises` table for that `user_id` and subscription, selects the highest `lesson` number, and returns all exercises in that lesson.
 * **Empty/Inactive States:** If the user is inactive, unsubscribed, or has no lessons generated yet, the UI renders a clean, localized state indicating the status.
 
-### 2.2. Webhook Ingestion (Internal API)
+### 2.2. Webhook Ingestion & Backend Lesson Generation (Internal API)
 * **Endpoint:** `POST /api/webhooks/n8n/lessons` protected via a static `X-API-Key` header.
-* **Workflow:** Triggered daily when the user receives their theoretical German email. n8n parses the email, prompts OpenRouter to generate the exercises JSON, and dispatches the payload to this endpoint (or inserts directly into Supabase via the Supabase node).
-* **Auto-Provisioning (Optional):** If an email arrives for a user not yet in the `users` table, the webhook can either reject the payload or auto-provision an active user and subscription record.
+* **Responsibility Split:**
+  * **n8n (transport only):** Triggered daily when the user receives their theoretical German email. n8n only extracts the recipient `email` and the raw lesson text from the email body and forwards them to this endpoint. n8n performs **no** AI calls, exercise generation, or database writes.
+  * **Backend (`language_exercises`):** Owns all lesson generation. It receives the raw text, builds the prompt, calls the AI model (OpenRouter) to generate the `theory_summary` and the exercises (multiple-choice with per-option explanations, and written prompts), validates the result against the `Exercise` Pydantic schemas, assigns the next sequential `lesson` number for the user and course, persists the rows in Supabase, and creates the magic link.
+* **Processing:** Generation may run as a background task; the endpoint responds `202 Accepted` quickly so n8n is not blocked. Invalid or unparseable AI output is retried a bounded number of times, then logged and rejected with an error status so n8n can surface the failure.
+* **Idempotency:** Re-sending the same email text for the same user and course must not create a duplicate lesson (e.g., deduplicate via a hash of the raw text).
+* **Auto-Provisioning (Inactive by Default):** If an email arrives for a user not yet in the `users` table, the backend creates the user with `is_active = False` (and a matching subscription record), and does not generate any exercises. The user must be activated manually (or by a separate process) before receiving lessons.
+* **Active-Only Generation:** Lesson generation (AI call, exercise persistence, lesson numbering, magic link creation) runs only when the user exists, `is_active` is `True`, and the subscription for the course has `is_subscribed = True`. Otherwise the backend skips generation, stores nothing beyond the provisioning above, and responds with a non-generating status (e.g., `202 Accepted` with `status: "skipped_inactive"`) so n8n does not treat it as a failure. Raw text from inactive users is not retained, so lessons are not back-filled on activation.
 
 ### 2.3. Exercise Evaluation & Feedback Engine
 * **Multiple Choice (Pre-Calculated & Instantaneous):**
@@ -221,12 +226,16 @@ class Answer_db(BaseModel):
 # ==========================================
 
 class WebhookIngestionPayload(BaseModel):
-    """Payload sent by n8n to create a new lesson's exercise rows."""
+    """Payload sent by n8n: only the recipient and the raw lesson text.
+    The backend generates the exercises, theory_summary and lesson number."""
     email: EmailStr
     course_name: str = "German Theory"
     date: dt_date = Field(default_factory=dt_date.today)
-    lesson: int = Field(..., gt=0)
-    theory_summary: Optional[str] = None
+    raw_text: str = Field(..., min_length=1, description="Raw lesson (theory email) text.")
+
+class GeneratedLesson(BaseModel):
+    """Structured output the backend requires from the AI model."""
+    theory_summary: str
     exercises: List[Exercise] = Field(..., min_length=1)
 
 class WrittenEvaluationRequest(BaseModel):

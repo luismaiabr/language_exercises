@@ -119,6 +119,62 @@ def test_written_exercise_evaluation():
     assert eval_res.is_correct is True
     assert len(eval_res.explanation) > 0
 
+def test_auto_subscription_and_1day_scheduling():
+    """Verify:
+    1. Users automatically subscribed to a new subject when created.
+    2. Lessons automatically scheduled for subscribed users at 1-day intervals.
+    """
+    # Create two active users
+    user_a = supabase_service.create_user(email=f"alice_{uuid4().hex[:6]}@example.com", name="Alice", is_active=True)
+    user_b = supabase_service.create_user(email=f"bob_{uuid4().hex[:6]}@example.com", name="Bob", is_active=True)
+
+    new_course = f"German_Subject_{uuid4().hex[:6]}"
+    assert supabase_service.is_new_course(new_course) is True
+
+    # Ingest Lesson 1 for new_course
+    payload_l1 = WebhookIngestionPayload(
+        email=user_a.email,
+        course_name=new_course,
+        raw_text="Lesson 1 Content: Das Alphabet und die Begrüßungen.",
+    )
+    res1 = asyncio.run(lesson_service.ingest_webhook_lesson(payload_l1))
+    assert res1.status == "processed"
+    assert res1.lesson == 1
+
+    # Verify both Alice and Bob are now subscribed to new_course
+    sub_a = supabase_service.get_subscription(user_a.id, new_course)
+    sub_b = supabase_service.get_subscription(user_b.id, new_course)
+    assert sub_a is not None and sub_a.is_subscribed is True
+    assert sub_b is not None and sub_b.is_subscribed is True
+
+    # Verify both have Lesson 1 scheduled
+    sched_a_l1 = supabase_service.get_user_schedule(user_a.id, new_course, lesson_id=1)
+    sched_b_l1 = supabase_service.get_user_schedule(user_b.id, new_course, lesson_id=1)
+    assert sched_a_l1 is not None and sched_a_l1.status == "pending"
+    assert sched_b_l1 is not None and sched_b_l1.status == "pending"
+
+    # Ingest Lesson 2 for new_course
+    payload_l2 = WebhookIngestionPayload(
+        email=user_a.email,
+        course_name=new_course,
+        raw_text="Lesson 2 Content: Die Zahlen von 1 bis 100 und das Alter.",
+    )
+    res2 = asyncio.run(lesson_service.ingest_webhook_lesson(payload_l2))
+    assert res2.status == "processed"
+    assert res2.lesson == 2
+
+    # Verify both have Lesson 2 scheduled
+    sched_a_l2 = supabase_service.get_user_schedule(user_a.id, new_course, lesson_id=2)
+    sched_b_l2 = supabase_service.get_user_schedule(user_b.id, new_course, lesson_id=2)
+    assert sched_a_l2 is not None and sched_a_l2.status == "pending"
+    assert sched_b_l2 is not None and sched_b_l2.status == "pending"
+
+    # Verify 1-day interval between lesson 1 and lesson 2
+    delta_a = sched_a_l2.when_to_send - sched_a_l1.when_to_send
+    delta_b = sched_b_l2.when_to_send - sched_b_l1.when_to_send
+    assert delta_a == timedelta(days=1), f"Expected 1 day delta, got {delta_a}"
+    assert delta_b == timedelta(days=1), f"Expected 1 day delta, got {delta_b}"
+
 if __name__ == "__main__":
     print("Running backend tests...")
     test_config_files_loaded()
@@ -131,4 +187,6 @@ if __name__ == "__main__":
     print("[OK] Magic link resolution & expiration test passed.")
     test_written_exercise_evaluation()
     print("[OK] Written exercise dynamic evaluation test passed.")
+    test_auto_subscription_and_1day_scheduling()
+    print("[OK] Auto-subscription and 1-day interval scheduling test passed.")
     print("ALL TESTS PASSED SUCCESSFULLY!")

@@ -91,3 +91,22 @@ CREATE TABLE IF NOT EXISTS lesson_ingestions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_lesson_ingestions_hash ON lesson_ingestions(user_id, course_name, text_hash);
+
+-- 8. USER SCHEDULES TABLE (Dispatches lesson emails via language_exercises_scheduler)
+CREATE TABLE IF NOT EXISTS user_schedules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    course_name VARCHAR(100) NOT NULL DEFAULT 'German Theory',
+    lesson_id INTEGER NOT NULL CHECK (lesson_id > 0),
+    when_to_send TIMESTAMPTZ NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending' NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'cancelled')),
+    sent_at TIMESTAMPTZ DEFAULT NULL,
+    error_message TEXT DEFAULT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT uq_user_schedules_user_course_lesson UNIQUE (user_id, course_name, lesson_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_schedules_pending ON user_schedules(status, when_to_send);
+CREATE INDEX IF NOT EXISTS idx_user_schedules_user_id ON user_schedules(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_schedules_email ON user_schedules(email);

@@ -5,7 +5,7 @@ prompts:
       Your task is to analyze the provided raw theory email text and generate a structured lesson with interactive exercises.
       
       Structure requirements:
-      1. "theory_summary": A clear, high-yield summary of the grammar rules, sentence patterns, and vocabulary taught in the text. Suitable for display to the student.
+      1. "theory_summary": The complete theory text formatted in clean Markdown, preserving the title, estimated time, Quick Bite, Pro-Tips, and Vocabulary/Pronunciation sections intact without including exercises.
       2. "exercises": A list of exercises testing the concepts in the lesson.
          - For multiple choice exercises ("exercise_type": "multiple_choice"):
            - Provide 3 to 4 realistic options.

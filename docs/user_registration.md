@@ -1,6 +1,6 @@
 # User Registration & Management Guide
 
-This document explains how users and course subscriptions are registered and managed in the AI-Driven German Exercise Platform.
+[🏠 Home (README)](../README.md) • [🏗️ Architecture](architecture.md) • [📡 API Reference](api_reference.md) • [🤖 AI Engine](ai_engine.md) • [🗄️ Database](database_schema.md) • [⚙️ Configuration](configuration.md) • [👤 User Management](user_registration.md) • [⚡ Ingestion Webhook](exercises_webhook.md)
 
 ---
 
@@ -8,8 +8,10 @@ This document explains how users and course subscriptions are registered and man
 
 The platform operates on a **Zero-Auth** model:
 - Students do not have accounts with passwords or sign-in sessions.
-- Students access their daily exercises and lessons directly via their personalized URL:
-  `http://localhost:5173/<email>/` (Frontend) or `http://localhost:8000/<email>/` (Backend).
+- Students access their daily exercises and lessons directly via capability tokens:
+  `http://localhost:5173/lesson/{token}` (Frontend) or `http://localhost:8000/api/lesson/{token}` (Backend).
+- Legacy direct email routing is also supported for developer access:
+  `http://localhost:5173/<email>/` or `http://localhost:8000/<email>/`.
 - For a student to receive AI-generated lessons, two conditions must be met:
   1. The user must exist in the `users` table with `is_active = TRUE`.
   2. The user must have a record in `subscriptions` for the course (e.g., `course_name = 'German Theory'`) with `is_subscribed = TRUE`.
@@ -100,6 +102,15 @@ When an incoming email lesson is ingested via the webhook (`POST /api/webhooks/n
 After running the registration script:
 
 1. **Verify via Backend API:**
-   Visit: `http://localhost:8000/<email>/` (e.g. `http://localhost:8000/luismaiasombra@gmail.com/`)
+   Visit: `http://localhost:8000/api/user/<email>/latest-lesson`
 2. **Verify via Frontend:**
-   Visit: `http://localhost:5173/<email>/` (e.g. `http://localhost:5173/luismaiasombra@gmail.com/`)
+   Visit: `http://localhost:5173/<email>/`
+
+---
+
+## 7. Next Steps & Related Documentation
+
+* [🏠 Back to README](../README.md)
+* [🗄️ Database Schema](database_schema.md) — Table schemas and indexes.
+* [⚡ Ingestion Webhook Guide](exercises_webhook.md) — How incoming payloads trigger provisioning.
+* [📡 API Reference](api_reference.md) — User and lesson resolution endpoints.

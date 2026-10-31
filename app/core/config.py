@@ -1,8 +1,9 @@
 from functools import lru_cache
+import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
 import yaml
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -28,12 +29,34 @@ class Settings(BaseSettings):
     )
 
     # ----------------------------------------------------
-    # SENSITIVE SECRETS (from .env)
+    # SENSITIVE SECRETS & CORS (from .env)
     # ----------------------------------------------------
     SUPABASE_URL: str = Field(default="https://placeholder.supabase.co")
     SUPABASE_KEY: str = Field(default="placeholder-key")
     OPENROUTER_API_KEY: str = Field(default="placeholder-openrouter-key")
     N8N_API_KEY: str = Field(default="placeholder-n8n-key")
+    CORS_ORIGINS: Optional[List[str]] = Field(default=None, alias="CORS_ORIGINS")
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> Optional[List[str]]:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [str(item).strip() for item in v if str(item).strip()]
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+            return [item.strip() for item in s.split(",") if item.strip()]
+        return None
 
     # ----------------------------------------------------
     # LOADED FROM YAML CONFIGS
@@ -90,7 +113,11 @@ class Settings(BaseSettings):
             self.server_host = app_data["server"].get("host", self.server_host)
             self.server_port = app_data["server"].get("port", self.server_port)
             self.server_reload = app_data["server"].get("reload", self.server_reload)
-            self.server_cors_origins = app_data["server"].get("cors_origins", self.server_cors_origins)
+            yaml_cors = app_data["server"].get("cors_origins", self.server_cors_origins)
+            if self.CORS_ORIGINS is not None and len(self.CORS_ORIGINS) > 0:
+                self.server_cors_origins = self.CORS_ORIGINS
+            else:
+                self.server_cors_origins = yaml_cors
             self.server_timeout_seconds = app_data["server"].get("timeout_seconds", self.server_timeout_seconds)
         if "magic_links" in app_data:
             self.magic_link_timespan_days = app_data["magic_links"].get("timespan_days", self.magic_link_timespan_days)

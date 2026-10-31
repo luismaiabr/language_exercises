@@ -1,5 +1,5 @@
 import logging
-from datetime import date as dt_date
+from datetime import date as dt_date, datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -61,6 +61,12 @@ class LessonService:
                 message="User is inactive. Lesson generation skipped.",
                 user_id=user.id,
             )
+
+        # Check if this course/subject is newly created in the system.
+        # If so, automatically subscribe all users to this new subject.
+        if self.db.is_new_course(course_name):
+            logger.info(f"New subject '{course_name}' detected. Auto-subscribing all users to this subject.")
+            self.db.subscribe_all_users_to_course(course_name)
 
         # Check Subscription
         subscription = self.db.get_subscription(user.id, course_name)
@@ -130,6 +136,61 @@ class LessonService:
             text_hash=text_hash,
             lesson=next_lesson,
         )
+
+        # 10. Automatically schedule lessons for all users subscribed to this subject (1-day intervals)
+        subscribers = self.db.get_subscribers_for_course(course_name, only_active_users=True)
+        if user.is_active and not any(s.id == user.id for s in subscribers):
+            subscribers.append(user)
+
+        for sub_user in subscribers:
+            # Replicate exercises and magic link for other subscribers so their link is ready
+            if sub_user.id != user.id:
+                sub_subscription = self.db.get_subscription(sub_user.id, course_name)
+                sub_sid = sub_subscription.id if sub_subscription else None
+                existing_sub_ex = self.db.get_exercises_by_lesson(sub_user.id, next_lesson, sub_sid)
+                if not existing_sub_ex:
+                    replicated_exercises = []
+                    for ex in generated.exercises:
+                        replicated_exercises.append({
+                            "user_id": sub_user.id,
+                            "subscription_id": sub_sid,
+                            "date": lesson_date,
+                            "lesson": next_lesson,
+                            "exercise_type": ex.exercise_type,
+                            "question": ex.question,
+                            "options": [opt.model_dump() for opt in ex.options] if ex.exercise_type == "multiple_choice" else None,
+                            "theory_summary": generated.theory_summary,
+                        })
+                    self.db.save_exercises(replicated_exercises)
+                    if sub_sid:
+                        self.db.create_magic_link(
+                            user_id=sub_user.id,
+                            subscription_id=sub_sid,
+                            lesson=next_lesson,
+                        )
+
+            # Check if this lesson is already scheduled for this user
+            existing_schedule = self.db.get_user_schedule(sub_user.id, course_name, next_lesson)
+            if not existing_schedule:
+                # Calculate when_to_send with 1-day interval
+                latest_schedule = self.db.get_latest_schedule_for_user(sub_user.id, course_name)
+                now_utc = datetime.now(timezone.utc)
+                if latest_schedule:
+                    latest_time = latest_schedule.when_to_send
+                    if latest_time.tzinfo is None:
+                        latest_time = latest_time.replace(tzinfo=timezone.utc)
+                    when_to_send = latest_time + timedelta(days=1)
+                else:
+                    when_to_send = now_utc
+
+                self.db.create_user_schedule(
+                    user_id=sub_user.id,
+                    email=sub_user.email,
+                    course_name=course_name,
+                    lesson_id=next_lesson,
+                    when_to_send=when_to_send,
+                )
+                logger.info(f"Auto-scheduled lesson {next_lesson} for {sub_user.email} at {when_to_send.isoformat()} (1-day interval).")
 
         logger.info(f"Successfully generated and persisted Lesson {next_lesson} with {len(saved_exercises)} exercises. Magic link: {magic_link_url}")
 

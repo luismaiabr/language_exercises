@@ -87,3 +87,20 @@ class MagicLink_db(BaseModel):
     @property
     def is_valid(self) -> bool:
         return (not self.is_revoked) and (not self.is_expired)
+
+class UserSchedule_db(BaseModel):
+    """Represents a row in the Supabase 'user_schedules' table."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(default_factory=uuid4)
+    user_id: UUID = Field(..., description="Foreign key referencing users.id.")
+    email: EmailStr = Field(..., description="User email for delivery.")
+    course_name: str = Field(default="German Theory", description="Course / subject identifier.")
+    lesson_id: int = Field(..., gt=0, description="Sequential lesson identifier / number.")
+    when_to_send: datetime = Field(..., description="Target dispatch timestamp for the email.")
+    status: Literal["pending", "sent", "failed", "cancelled"] = Field(
+        default="pending", description="Dispatch delivery status."
+    )
+    sent_at: Optional[datetime] = Field(default=None, description="Timestamp when email was sent via SMTP.")
+    error_message: Optional[str] = Field(default=None, description="Error details if delivery failed.")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

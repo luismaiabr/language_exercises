@@ -6,7 +6,14 @@ from uuid import UUID, uuid4
 from supabase import Client, create_client
 
 from app.core.config import settings
-from app.schemas.db import Answer_db, Exercise_db, MagicLink_db, Subscription_db, User_db
+from app.schemas.db import (
+    Answer_db,
+    Exercise_db,
+    MagicLink_db,
+    Subscription_db,
+    User_db,
+    UserSchedule_db,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +27,7 @@ class SupabaseService:
         self._mock_magic_links: Dict[str, MagicLink_db] = {}  # by token
         self._mock_ingestions: List[Dict[str, Any]] = []
         self._mock_answers: List[Answer_db] = []
+        self._mock_user_schedules: List[UserSchedule_db] = []
         self._init_client()
 
     def _init_client(self):
@@ -145,6 +153,100 @@ class SupabaseService:
         sub = Subscription_db(id=uuid4(), user_id=user_id, course_name=course_name, is_subscribed=is_subscribed)
         self._mock_subscriptions[str(sub.id)] = sub
         return sub
+
+    def get_all_users(self, only_active: bool = False) -> List[User_db]:
+        """Fetch all users, optionally filtering for active users."""
+        if self.client:
+            try:
+                query = self.client.table("users").select("*")
+                if only_active:
+                    query = query.eq("is_active", True)
+                res = query.execute()
+                return [User_db.model_validate(row) for row in res.data]
+            except Exception as e:
+                logger.warning(f"Live Supabase get_all_users failed ({e}). Falling back to memory store.")
+
+        users = list(self._mock_users.values())
+        if only_active:
+            users = [u for u in users if u.is_active]
+        return users
+
+    def is_new_course(self, course_name: str) -> bool:
+        """
+        Check if course_name is newly introduced (i.e. has no existing subscriptions or exercises).
+        """
+        course_clean = course_name.strip()
+        if self.client:
+            try:
+                res = self.client.table("subscriptions").select("id").eq("course_name", course_clean).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return False
+                return True
+            except Exception as e:
+                logger.warning(f"Live Supabase is_new_course check failed ({e}). Falling back to memory store.")
+
+        for sub in self._mock_subscriptions.values():
+            if sub.course_name.strip() == course_clean:
+                return False
+        return True
+
+    def get_subscribers_for_course(self, course_name: str, only_active_users: bool = True) -> List[User_db]:
+        """
+        Fetch all users actively subscribed to course_name.
+        """
+        course_clean = course_name.strip()
+        subscribers: List[User_db] = []
+        if self.client:
+            try:
+                res = (
+                    self.client.table("subscriptions")
+                    .select("user_id")
+                    .eq("course_name", course_clean)
+                    .eq("is_subscribed", True)
+                    .execute()
+                )
+                user_ids = [row["user_id"] for row in (res.data or [])]
+                for uid in user_ids:
+                    user = self.get_user_by_id(UUID(uid))
+                    if user and (not only_active_users or user.is_active):
+                        subscribers.append(user)
+                return subscribers
+            except Exception as e:
+                logger.warning(f"Live Supabase get_subscribers_for_course failed ({e}). Falling back to memory store.")
+
+        for sub in self._mock_subscriptions.values():
+            if sub.course_name.strip() == course_clean and sub.is_subscribed:
+                user = self._mock_users.get(str(sub.user_id))
+                if user and (not only_active_users or user.is_active):
+                    subscribers.append(user)
+        return subscribers
+
+    def subscribe_all_users_to_course(self, course_name: str, only_active: bool = False) -> List[Subscription_db]:
+        """
+        Automatically subscribe all existing users to a new subject/course.
+        """
+        course_clean = course_name.strip()
+        users = self.get_all_users(only_active=only_active)
+        created_subs: List[Subscription_db] = []
+
+        for user in users:
+            existing = self.get_subscription(user.id, course_clean)
+            if not existing:
+                sub = self.create_subscription(user_id=user.id, course_name=course_clean, is_subscribed=True)
+                created_subs.append(sub)
+                logger.info(f"Auto-subscribed user {user.email} to new subject '{course_clean}'.")
+            elif not existing.is_subscribed:
+                # Reactivate subscription if it was inactive
+                if self.client:
+                    try:
+                        self.client.table("subscriptions").update({"is_subscribed": True}).eq("id", str(existing.id)).execute()
+                        existing.is_subscribed = True
+                    except Exception as e:
+                        logger.warning(f"Failed to update subscription in live Supabase: {e}")
+                existing.is_subscribed = True
+                created_subs.append(existing)
+
+        return created_subs
 
     # ----------------------------------------------------
     # EXERCISES
@@ -403,5 +505,178 @@ class SupabaseService:
 
         self._mock_answers.append(record)
         return record
+
+    # ----------------------------------------------------
+    # USER SCHEDULES (language_exercises_scheduler)
+    # ----------------------------------------------------
+    def get_latest_schedule_for_user(
+        self, user_id: UUID, course_name: str
+    ) -> Optional[UserSchedule_db]:
+        """
+        Fetch the most recently scheduled lesson for this user and course.
+        """
+        uid_str = str(user_id)
+        course_clean = course_name.strip()
+        if self.client:
+            try:
+                res = (
+                    self.client.table("user_schedules")
+                    .select("*")
+                    .eq("user_id", uid_str)
+                    .eq("course_name", course_clean)
+                    .order("when_to_send", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if res.data and len(res.data) > 0:
+                    return UserSchedule_db.model_validate(res.data[0])
+                return None
+            except Exception as e:
+                logger.warning(f"Live Supabase get_latest_schedule_for_user failed ({e}). Falling back to memory store.")
+
+        matching = [
+            s for s in self._mock_user_schedules
+            if str(s.user_id) == uid_str and s.course_name == course_clean
+        ]
+        if not matching:
+            return None
+        matching.sort(key=lambda s: s.when_to_send, reverse=True)
+        return matching[0]
+
+    def get_user_schedule(
+        self, user_id: UUID, course_name: str, lesson_id: int
+    ) -> Optional[UserSchedule_db]:
+        """
+        Find an existing schedule for a specific user, course, and lesson.
+        """
+        uid_str = str(user_id)
+        course_clean = course_name.strip()
+        if self.client:
+            try:
+                res = (
+                    self.client.table("user_schedules")
+                    .select("*")
+                    .eq("user_id", uid_str)
+                    .eq("course_name", course_clean)
+                    .eq("lesson_id", lesson_id)
+                    .limit(1)
+                    .execute()
+                )
+                if res.data and len(res.data) > 0:
+                    return UserSchedule_db.model_validate(res.data[0])
+                return None
+            except Exception as e:
+                logger.warning(f"Live Supabase get_user_schedule failed ({e}). Falling back to memory store.")
+
+        for s in self._mock_user_schedules:
+            if str(s.user_id) == uid_str and s.course_name == course_clean and s.lesson_id == lesson_id:
+                return s
+        return None
+
+    def create_user_schedule(
+        self,
+        user_id: UUID,
+        email: str,
+        course_name: str,
+        lesson_id: int,
+        when_to_send: datetime,
+    ) -> UserSchedule_db:
+        """
+        Schedule a lesson email for a user at when_to_send.
+        """
+        schedule = UserSchedule_db(
+            id=uuid4(),
+            user_id=user_id,
+            email=email.strip().lower(),
+            course_name=course_name.strip(),
+            lesson_id=lesson_id,
+            when_to_send=when_to_send,
+            status="pending",
+        )
+
+        if self.client:
+            try:
+                data = {
+                    "id": str(schedule.id),
+                    "user_id": str(schedule.user_id),
+                    "email": schedule.email,
+                    "course_name": schedule.course_name,
+                    "lesson_id": schedule.lesson_id,
+                    "when_to_send": schedule.when_to_send.isoformat(),
+                    "status": schedule.status,
+                    "created_at": schedule.created_at.isoformat(),
+                }
+                res = self.client.table("user_schedules").insert(data).execute()
+                return UserSchedule_db.model_validate(res.data[0])
+            except Exception as e:
+                logger.warning(f"Live Supabase create_user_schedule failed ({e}). Falling back to memory store.")
+
+        self._mock_user_schedules.append(schedule)
+        return schedule
+
+    def get_due_schedules(self, target_time: Optional[datetime] = None) -> List[UserSchedule_db]:
+        """
+        Retrieve all pending schedules whose when_to_send <= target_time (default now).
+        """
+        now = target_time or datetime.now(timezone.utc)
+        if self.client:
+            try:
+                res = (
+                    self.client.table("user_schedules")
+                    .select("*")
+                    .eq("status", "pending")
+                    .lte("when_to_send", now.isoformat())
+                    .order("when_to_send", desc=False)
+                    .execute()
+                )
+                return [UserSchedule_db.model_validate(row) for row in res.data]
+            except Exception as e:
+                logger.warning(f"Live Supabase get_due_schedules failed ({e}). Falling back to memory store.")
+
+        due = []
+        for s in self._mock_user_schedules:
+            if s.status == "pending":
+                s_time = s.when_to_send if s.when_to_send.tzinfo else s.when_to_send.replace(tzinfo=timezone.utc)
+                if s_time <= now:
+                    due.append(s)
+        due.sort(key=lambda s: s.when_to_send)
+        return due
+
+    def update_schedule_status(
+        self,
+        schedule_id: UUID,
+        status: str,
+        sent_at: Optional[datetime] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[UserSchedule_db]:
+        """
+        Update the status (sent, failed, etc.) of a user schedule.
+        """
+        sid_str = str(schedule_id)
+        now = sent_at or datetime.now(timezone.utc)
+
+        if self.client:
+            try:
+                data = {"status": status}
+                if status == "sent":
+                    data["sent_at"] = now.isoformat()
+                if error_message:
+                    data["error_message"] = error_message
+                res = self.client.table("user_schedules").update(data).eq("id", sid_str).execute()
+                if res.data and len(res.data) > 0:
+                    return UserSchedule_db.model_validate(res.data[0])
+                return None
+            except Exception as e:
+                logger.warning(f"Live Supabase update_schedule_status failed ({e}). Falling back to memory store.")
+
+        for s in self._mock_user_schedules:
+            if str(s.id) == sid_str:
+                s.status = status  # type: ignore
+                if status == "sent":
+                    s.sent_at = now
+                if error_message:
+                    s.error_message = error_message
+                return s
+        return None
 
 supabase_service = SupabaseService()

@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = Field(default="placeholder-openrouter-key")
     N8N_API_KEY: str = Field(default="placeholder-n8n-key")
     CORS_ORIGINS: Optional[List[str]] = Field(default=None, alias="CORS_ORIGINS")
+    MAGIC_LINK_BASE_URL: Optional[str] = Field(default=None, alias="MAGIC_LINK_BASE_URL")
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
@@ -121,7 +122,8 @@ class Settings(BaseSettings):
             self.server_timeout_seconds = app_data["server"].get("timeout_seconds", self.server_timeout_seconds)
         if "magic_links" in app_data:
             self.magic_link_timespan_days = app_data["magic_links"].get("timespan_days", self.magic_link_timespan_days)
-            self.magic_link_base_url = app_data["magic_links"].get("base_url", self.magic_link_base_url)
+            yaml_magic = app_data["magic_links"].get("base_url", self.magic_link_base_url)
+            self.magic_link_base_url = self.MAGIC_LINK_BASE_URL or yaml_magic
         if "courses" in app_data:
             self.default_course_name = app_data["courses"].get("default_course_name", self.default_course_name)
             self.auto_provision_inactive = app_data["courses"].get("auto_provision_inactive", self.auto_provision_inactive)

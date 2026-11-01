@@ -401,6 +401,34 @@ class SupabaseService:
 
         return self._mock_magic_links.get(token)
 
+    def get_active_magic_link(self, user_id: UUID, lesson: int) -> Optional[MagicLink_db]:
+        """Fetch the latest unrevoked, unexpired magic link for a user and lesson."""
+        uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+        if self.client:
+            try:
+                res = (
+                    self.client.table("magic_links")
+                    .select("*")
+                    .eq("user_id", uid_str)
+                    .eq("lesson", lesson)
+                    .eq("is_revoked", False)
+                    .gte("expires_at", now.isoformat())
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if res.data and len(res.data) > 0:
+                    return MagicLink_db.model_validate(res.data[0])
+                return None
+            except Exception as e:
+                logger.warning(f"Live Supabase get_active_magic_link failed ({e}). Falling back to memory store.")
+
+        for m in self._mock_magic_links.values():
+            if str(m.user_id) == uid_str and m.lesson == lesson and not m.is_revoked and m.expires_at >= now:
+                return m
+        return None
+
     def update_magic_link_accessed(self, token: str):
         now = datetime.now(timezone.utc)
         if self.client:

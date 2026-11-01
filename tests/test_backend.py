@@ -175,6 +175,31 @@ def test_auto_subscription_and_1day_scheduling():
     assert delta_a == timedelta(days=1), f"Expected 1 day delta, got {delta_a}"
     assert delta_b == timedelta(days=1), f"Expected 1 day delta, got {delta_b}"
 
+def test_instant_dispatch_mechanism():
+    """Verify that when instant_dispatch=True, lesson is dispatched immediately and marked sent."""
+    from app.services.email_service import email_service
+    email_service.is_mock = True
+
+    email = f"instant_user_{uuid4().hex[:8]}@example.com"
+    user = supabase_service.create_user(email=email, name="Instant User", is_active=True)
+    supabase_service.create_subscription(user.id, "Instant German", is_subscribed=True)
+
+    payload = WebhookIngestionPayload(
+        email=user.email,
+        course_name="Instant German",
+        raw_text="Thema: Perfekt mit haben und sein. Regel: Bewegungsverben nutzen sein.",
+        instant_dispatch=True,
+    )
+    res = asyncio.run(lesson_service.ingest_webhook_lesson(payload))
+    assert res.status == "processed"
+    assert res.dispatched_instantly is True
+
+    # Verify user_schedules is immediately marked 'sent'
+    sched = supabase_service.get_user_schedule(user.id, "Instant German", lesson_id=1)
+    assert sched is not None
+    assert sched.status == "sent"
+    assert sched.sent_at is not None
+
 if __name__ == "__main__":
     print("Running backend tests...")
     test_config_files_loaded()
@@ -189,4 +214,6 @@ if __name__ == "__main__":
     print("[OK] Written exercise dynamic evaluation test passed.")
     test_auto_subscription_and_1day_scheduling()
     print("[OK] Auto-subscription and 1-day interval scheduling test passed.")
+    test_instant_dispatch_mechanism()
+    print("[OK] Instant dispatch mechanism test passed.")
     print("ALL TESTS PASSED SUCCESSFULLY!")

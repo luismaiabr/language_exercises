@@ -13,6 +13,11 @@ from app.schemas.api import (
 )
 from app.schemas.db import Exercise_db, Subscription_db, User_db
 from app.services.ai_service import ai_service
+from app.services.email_service import (
+    email_service,
+    render_html_email,
+    render_plain_text_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,16 +142,27 @@ class LessonService:
             lesson=next_lesson,
         )
 
-        # 10. Automatically schedule lessons for all users subscribed to this subject (1-day intervals)
+        # Determine whether instant dispatch is requested (payload override or system setting)
+        instant_dispatch = (
+            payload.instant_dispatch
+            if payload.instant_dispatch is not None
+            else settings.INSTANT_DISPATCH
+        )
+
+        # 10. Automatically schedule lessons or instantly dispatch them
         subscribers = self.db.get_subscribers_for_course(course_name, only_active_users=True)
         if user.is_active and not any(s.id == user.id for s in subscribers):
             subscribers.append(user)
 
+        frontend_base = (settings.FRONTEND_BASE_URL or "https://lfront.xseed.space").rstrip("/")
+        dispatched_count = 0
+
         for sub_user in subscribers:
+            sub_subscription = self.db.get_subscription(sub_user.id, course_name)
+            sub_sid = sub_subscription.id if sub_subscription else None
+
             # Replicate exercises and magic link for other subscribers so their link is ready
             if sub_user.id != user.id:
-                sub_subscription = self.db.get_subscription(sub_user.id, course_name)
-                sub_sid = sub_subscription.id if sub_subscription else None
                 existing_sub_ex = self.db.get_exercises_by_lesson(sub_user.id, next_lesson, sub_sid)
                 if not existing_sub_ex:
                     replicated_exercises = []
@@ -169,40 +185,126 @@ class LessonService:
                             lesson=next_lesson,
                         )
 
+            # Resolve capability magic link for this subscriber
+            sub_magic_link = self.db.get_active_magic_link(sub_user.id, next_lesson)
+            sub_token = sub_magic_link.token if sub_magic_link else (magic_link.token if sub_user.id == user.id else "")
+            sub_magic_url = f"{frontend_base}/lesson/{sub_token}" if sub_token else magic_link_url
+
             # Check if this lesson is already scheduled for this user
             existing_schedule = self.db.get_user_schedule(sub_user.id, course_name, next_lesson)
-            if not existing_schedule:
-                # Calculate when_to_send with 1-day interval
-                latest_schedule = self.db.get_latest_schedule_for_user(sub_user.id, course_name)
-                now_utc = datetime.now(timezone.utc)
-                if latest_schedule:
-                    latest_time = latest_schedule.when_to_send
-                    if latest_time.tzinfo is None:
-                        latest_time = latest_time.replace(tzinfo=timezone.utc)
-                    when_to_send = latest_time + timedelta(days=1)
-                else:
-                    when_to_send = now_utc
+            now_utc = datetime.now(timezone.utc)
 
-                self.db.create_user_schedule(
-                    user_id=sub_user.id,
-                    email=sub_user.email,
+            if instant_dispatch:
+                # INSTANT DISPATCH: Disable/bypass scheduler daemon; send email immediately as soon as lesson is ready
+                if not existing_schedule:
+                    existing_schedule = self.db.create_user_schedule(
+                        user_id=sub_user.id,
+                        email=sub_user.email,
+                        course_name=course_name,
+                        lesson_id=next_lesson,
+                        when_to_send=now_utc,
+                    )
+
+                logger.info(f"INSTANT_DISPATCH active: sending Lesson #{next_lesson} email directly to {sub_user.email}...")
+                sent_ok = await self.dispatch_instant_email(
+                    user_email=sub_user.email,
+                    user_name=sub_user.name,
                     course_name=course_name,
                     lesson_id=next_lesson,
-                    when_to_send=when_to_send,
+                    theory_summary=generated.theory_summary,
+                    magic_link_url=sub_magic_url,
                 )
-                logger.info(f"Auto-scheduled lesson {next_lesson} for {sub_user.email} at {when_to_send.isoformat()} (1-day interval).")
+
+                if sent_ok and existing_schedule:
+                    self.db.update_schedule_status(existing_schedule.id, status="sent", sent_at=now_utc)
+                    dispatched_count += 1
+                    logger.info(f"Instant dispatch completed for {sub_user.email}. Schedule marked 'sent'.")
+                elif not sent_ok and existing_schedule:
+                    logger.warning(f"Instant dispatch email attempt failed for {sub_user.email}. Schedule left as 'pending'.")
+            else:
+                # NORMAL SCHEDULING (1-day intervals managed by scheduler)
+                if not existing_schedule:
+                    latest_schedule = self.db.get_latest_schedule_for_user(sub_user.id, course_name)
+                    if latest_schedule:
+                        latest_time = latest_schedule.when_to_send
+                        if latest_time.tzinfo is None:
+                            latest_time = latest_time.replace(tzinfo=timezone.utc)
+                        when_to_send = latest_time + timedelta(days=1)
+                    else:
+                        when_to_send = now_utc
+
+                    self.db.create_user_schedule(
+                        user_id=sub_user.id,
+                        email=sub_user.email,
+                        course_name=course_name,
+                        lesson_id=next_lesson,
+                        when_to_send=when_to_send,
+                    )
+                    logger.info(f"Auto-scheduled lesson {next_lesson} for {sub_user.email} at {when_to_send.isoformat()} (1-day interval).")
 
         logger.info(f"Successfully generated and persisted Lesson {next_lesson} with {len(saved_exercises)} exercises. Magic link: {magic_link_url}")
 
+        dispatch_msg = " Dispatched instantly via email." if (instant_dispatch and dispatched_count > 0) else ""
         return IngestionResponse(
             status="processed",
-            message=f"Lesson {next_lesson} successfully generated with {len(saved_exercises)} exercises.",
+            message=f"Lesson {next_lesson} successfully generated with {len(saved_exercises)} exercises.{dispatch_msg}",
             user_id=user.id,
             lesson=next_lesson,
             magic_link_token=magic_link.token,
             magic_link_url=magic_link_url,
             exercise_count=len(saved_exercises),
+            dispatched_instantly=(instant_dispatch and dispatched_count > 0),
         )
+
+    async def dispatch_instant_email(
+        self,
+        user_email: str,
+        user_name: str,
+        course_name: str,
+        lesson_id: int,
+        theory_summary: Optional[str],
+        magic_link_url: str,
+    ) -> bool:
+        """
+        Delivers the lesson email immediately when INSTANT_DISPATCH is enabled.
+        1. If SMTP is configured, sends directly via SMTP.
+        2. If SMTP is not configured or fails, triggers the remote scheduler's /api/cron endpoint.
+        """
+        subject = f"🇩🇪 {course_name} — Lektion #{lesson_id:03d}"
+        plain_text = render_plain_text_email(
+            student_name=user_name,
+            course_name=course_name,
+            lesson_id=lesson_id,
+            theory_summary=theory_summary,
+            magic_link_url=magic_link_url,
+        )
+        html_content = render_html_email(
+            student_name=user_name,
+            course_name=course_name,
+            lesson_id=lesson_id,
+            theory_summary=theory_summary,
+            magic_link_url=magic_link_url,
+        )
+
+        # 1. Try direct SMTP delivery
+        if settings.is_smtp_configured:
+            result = email_service.send_lesson_email(
+                recipient_email=user_email,
+                subject=subject,
+                text_content=plain_text,
+                html_content=html_content,
+            )
+            if result.success:
+                logger.info(f"Instant email successfully sent via SMTP to {user_email}.")
+                return True
+            else:
+                logger.warning(
+                    f"Direct SMTP instant delivery to {user_email} failed ({result.error}). Attempting scheduler trigger fallback..."
+                )
+
+        # 2. Fallback to remote scheduler /api/cron trigger
+        processed = await email_service.trigger_scheduler_cron()
+        return processed > 0
 
     def resolve_magic_link(self, token: str) -> MagicLinkResolutionResponse:
         """

@@ -38,6 +38,27 @@ class Settings(BaseSettings):
     CORS_ORIGINS: Optional[List[str]] = Field(default=None, alias="CORS_ORIGINS")
     MAGIC_LINK_BASE_URL: Optional[str] = Field(default=None, alias="MAGIC_LINK_BASE_URL")
 
+    # Instant Dispatch & Remote Scheduler Trigger
+    INSTANT_DISPATCH: bool = Field(default=False, alias="INSTANT_DISPATCH")
+    SCHEDULER_URL: str = Field(default="https://lschedule.xseed.space", alias="SCHEDULER_URL")
+    CRON_SECRET: Optional[str] = Field(default=None, alias="CRON_SECRET")
+    FRONTEND_BASE_URL: str = Field(default="https://lfront.xseed.space", alias="FRONTEND_BASE_URL")
+
+    # SMTP Configuration (for direct email delivery from backend when INSTANT_DISPATCH=true)
+    SMTP_HOST: str = Field(default="smtp.hostinger.com", alias="SMTP_HOST")
+    SMTP_PORT: int = Field(default=587, alias="SMTP_PORT")
+    SMTP_USER: str = Field(default="education@xseed.space", alias="SMTP_USER")
+    SMTP_PASSWORD: str = Field(default="", alias="SMTP_PASSWORD")
+    SMTP_FROM_EMAIL: str = Field(default="education@xseed.space", alias="SMTP_FROM_EMAIL")
+    SMTP_FROM_NAME: str = Field(default="Deutsch Daily", alias="SMTP_FROM_NAME")
+    SMTP_USE_TLS: bool = Field(default=True, alias="SMTP_USE_TLS")
+    SMTP_USE_SSL: bool = Field(default=False, alias="SMTP_USE_SSL")
+    SMTP_TIMEOUT: int = Field(default=15, alias="SMTP_TIMEOUT")
+
+    @property
+    def is_smtp_configured(self) -> bool:
+        return bool(self.SMTP_HOST and self.SMTP_USER and self.SMTP_PASSWORD)
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> Optional[List[str]]:
@@ -127,6 +148,10 @@ class Settings(BaseSettings):
         if "courses" in app_data:
             self.default_course_name = app_data["courses"].get("default_course_name", self.default_course_name)
             self.auto_provision_inactive = app_data["courses"].get("auto_provision_inactive", self.auto_provision_inactive)
+            if "instant_dispatch" in app_data["courses"]:
+                import os
+                if "INSTANT_DISPATCH" not in os.environ:
+                    self.INSTANT_DISPATCH = bool(app_data["courses"]["instant_dispatch"])
 
         # 2. Load ai.yaml
         ai_data = load_yaml(CONFIG_DIR / "ai.yaml")

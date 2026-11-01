@@ -22,6 +22,7 @@ magic_links:
 courses:
   default_course_name: "German Theory"
   auto_provision_inactive: true
+  instant_dispatch: false
   allowed_exercise_types:
     - "multiple_choice"
     - "written"

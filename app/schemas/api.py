@@ -15,6 +15,10 @@ class WebhookIngestionPayload(BaseModel):
     course_name: str = "German Theory"
     date: dt_date = Field(default_factory=dt_date.today)
     raw_text: str = Field(..., min_length=1, description="Raw lesson (theory email) text.")
+    instant_dispatch: Optional[bool] = Field(
+        default=None,
+        description="Override instant delivery on creation (True sends immediately and bypasses scheduler queue).",
+    )
 
 class IngestionResponse(BaseModel):
     """Status returned by webhook endpoint to n8n."""
@@ -25,6 +29,7 @@ class IngestionResponse(BaseModel):
     magic_link_url: Optional[str] = None
     magic_link_token: Optional[str] = None
     exercise_count: Optional[int] = None
+    dispatched_instantly: Optional[bool] = None
 
 class WrittenEvaluationRequest(BaseModel):
     """Payload sent by the frontend when submitting a written answer by exercise_id."""
